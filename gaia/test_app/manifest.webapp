@@ -1,0 +1,27 @@
+{
+  "name": "TestApp",
+  "description": "TestApp",
+  "launch_path": "/index.html",
+  "type": "certified",
+  "developer": {
+    "name": "Albert Crespell Perez"
+  },
+  "locales": {
+    "en-US": {
+      "name": "TestApp",
+      "description": "TestApp"
+    }
+  },
+  "default_locale": "en-US",
+  "icons": {
+    "60": "/style/icons/reader.png"
+  },
+  "permissions": {
+    "alarms": {},
+    "networkstats-manage":{}
+  },
+  "messages": [
+     { "alarm": "/index.html" }
+   ],
+  "orientation": "portrait-primary"
+}

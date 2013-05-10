@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <title>Test app</title>
+
+    <!-- Shared styles -->
+    <link rel="stylesheet" type="text/css" href="shared/style/headers.css">
+    <link rel="stylesheet" type="text/css" href="shared/style/buttons.css">
+    <link rel="stylesheet" type="text/css" href="shared/style/input_areas.css">
+
+    <!-- Specific code -->
+    <link rel="stylesheet" type="text/css" href="style/reader.css">
+
+    <!-- Specific code -->
+    <script defer type="application/javascript" src="js/test.js"></script>
+  </head>
+
+  <body>
+    <!-- Main view -->
+    <section class="view" role="region">
+      <header>
+        <h1>Test app</h1>
+      </header>
+
+      <section>
+        <input id="value1" type="text" placeholder="Threshold"/>
+        <button id="button1" class="button">Set alarm</button>
+        <button id="button2" class="button">Get alarms</button>
+        <input id="value2" type="text" placeholder="Alarm Id"/>
+        <button id="button3" class="button">Remove alarm</button>
+      </section>
+    </section>
+  </body>
+</html>
