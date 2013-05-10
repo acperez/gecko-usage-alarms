@@ -1,0 +1,156 @@
+# HG changeset patch
+# Parent 50d25e083421ddcfa998f1ac81075d2c5c507262
+# User Albert Crespell <acperez@tid.es>
+Bug 783966 - process netd's InterfaceChange(600) and BandwidthControl(601) message. r=vchang
+
+diff --git a/dom/system/gonk/NetworkManager.js b/dom/system/gonk/NetworkManager.js
+--- a/dom/system/gonk/NetworkManager.js
++++ b/dom/system/gonk/NetworkManager.js
+@@ -389,16 +389,20 @@ NetworkManager.prototype = {
+     }
+     this.worker.postMessage(params);
+   },
+ 
+   handleWorkerMessage: function handleWorkerMessage(e) {
+     debug("NetworkManager received message from worker: " + JSON.stringify(e.data));
+     let response = e.data;
+     let id = response.id;
++    if (id == 'broadcast') {
++      Services.obs.notifyObservers(null, response.topic, response.reason);
++      return;
++    }
+     let callback = this.controlCallbacks[id];
+     if (callback) {
+       callback.call(this, response);
+     }
+   },
+ 
+   /**
+    * Determine the active interface and configure it.
+diff --git a/dom/system/gonk/net_worker.js b/dom/system/gonk/net_worker.js
+--- a/dom/system/gonk/net_worker.js
++++ b/dom/system/gonk/net_worker.js
+@@ -19,16 +19,19 @@ const DEBUG = false;
+ 
+ const PERSIST_SYS_USB_CONFIG_PROPERTY = "persist.sys.usb.config";
+ const SYS_USB_CONFIG_PROPERTY         = "sys.usb.config";
+ const SYS_USB_STATE_PROPERTY          = "sys.usb.state";
+ 
+ const USB_FUNCTION_RNDIS  = "rndis";
+ const USB_FUNCTION_ADB    = "adb";
+ 
++const kNetdInterfaceChangedTopic = "netd-interface-change";
++const kNetdBandwidthControlTopic = "netd-bandwidth-control";
++
+ // Retry 20 times (2 seconds) for usb state transition.
+ const USB_FUNCTION_RETRY_TIMES = 20;
+ // Check "sys.usb.state" every 100ms.
+ const USB_FUNCTION_RETRY_INTERVAL = 100;
+ 
+ // 1xx - Requested action is proceeding
+ const NETD_COMMAND_PROCEEDING   = 100;
+ // 2xx - Requested action has been successfully completed
+@@ -36,32 +39,57 @@ const NETD_COMMAND_OKAY         = 200;
+ // 4xx - The command is accepted but the requested action didn't
+ // take place.
+ const NETD_COMMAND_FAIL         = 400;
+ // 5xx - The command syntax or parameters error
+ const NETD_COMMAND_ERROR        = 500;
+ // 6xx - Unsolicited broadcasts
+ const NETD_COMMAND_UNSOLICITED  = 600;
+ 
++// Broadcast messages
++const NETD_COMMAND_INTERFACE_CHANGE     = 600;
++const NETD_COMMAND_BANDWIDTH_CONTROLLER = 601;
++
+ importScripts("systemlibs.js");
+ 
+ function netdResponseType(code) {
+   return Math.floor(code/100)*100;
+ }
+ 
++function isBroadcastMessage(code) {
++  let type = netdResponseType(code);
++  return (type == NETD_COMMAND_UNSOLICITED);
++}
++
+ function isError(code) {
+   let type = netdResponseType(code);
+   return (type != NETD_COMMAND_PROCEEDING && type != NETD_COMMAND_OKAY);
+ }
+ 
+ function isComplete(code) {
+   let type = netdResponseType(code);
+   return (type != NETD_COMMAND_PROCEEDING);
+ }
+ 
++function sendBroadcastMessage(code, reason) {
++  let topic = null;
++  switch (code) {
++    case NETD_COMMAND_INTERFACE_CHANGE:
++      topic = "netd-interface-change";
++      break;
++    case NETD_COMMAND_BANDWIDTH_CONTROLLER:
++      topic = "netd-bandwidth-control";
++      break;
++  }
++
++  if (topic) {
++    postMessage({id: 'broadcast', topic: topic, reason: reason});
++  }
++}
++
+ let gWifiFailChain = [stopSoftAP,
+                       setIpForwardingEnabled,
+                       stopTethering];
+ 
+ function wifiTetheringFail(params) {
+   // Notify the main thread.
+   postMessage(params);
+ 
+@@ -248,16 +276,22 @@ function onNetdMessage(data) {
+   }
+ 
+   // Set pending to false before we handle next command.
+   debug("Receiving '" + gCurrentCommand + "' command response from netd.");
+   debug("          ==> Code: " + code + "  Reason: " + reason);
+ 
+   // 1xx response code regards as command is proceeding, we need to wait for
+   // final response code such as 2xx, 4xx and 5xx before sending next command.
++  if (isBroadcastMessage(code)) {
++    sendBroadcastMessage(code, reason);
++    nextNetdCommand();
++    return;
++  }
++
+   if (isComplete(code)) {
+     gPending = false;
+   }
+   if (gCurrentCallback) {
+     gCurrentCallback(isError(code), {code: code, reason: reason});
+   }
+ 
+   // Handling pending commands if any.
+diff --git a/ipc/netd/Netd.cpp b/ipc/netd/Netd.cpp
+--- a/ipc/netd/Netd.cpp
++++ b/ipc/netd/Netd.cpp
+@@ -151,18 +151,17 @@ NetdClient::OpenSocket()
+ void NetdClient::OnLineRead(int aFd, nsDependentCSubstring& aMessage)
+ {
+   // Set errno to 0 first. For preventing to use the stale version of errno.
+   errno = 0;
+   // We found a line terminator. Each line is formatted as an
+   // integer response code followed by the rest of the line.
+   // Fish out the response code.
+   int responseCode = strtol(aMessage.Data(), nullptr, 10);
+-  // TODO, Bug 783966, handle InterfaceChange(600) and BandwidthControl(601).
+-  if (!errno && responseCode < 600) {
++  if (!errno) {
+     NetdCommand* response = new NetdCommand();
+     // Passing all the response message, including the line terminator.
+     response->mSize = aMessage.Length();
+     memcpy(response->mData, aMessage.Data(), aMessage.Length());
+     gNetdConsumer->MessageReceived(response);
+   }
+ 
+   if (!responseCode) {

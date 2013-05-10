@@ -1,0 +1,1414 @@
+# HG changeset patch
+# Parent 187dff865cb34183de004287c0aef891bbaaac20
+# User Albert Crespell <acperez@tid.es>
+Bug 858005 - Part 3/3 Alarm implementation.
+
+diff --git a/dom/network/src/NetworkStatsDB.jsm b/dom/network/src/NetworkStatsDB.jsm
+--- a/dom/network/src/NetworkStatsDB.jsm
++++ b/dom/network/src/NetworkStatsDB.jsm
+@@ -1,76 +1,91 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+ this.EXPORTED_SYMBOLS = ['NetworkStatsDB'];
+ 
+-const DEBUG = false;
++const DEBUG = true;
+ function debug(s) { dump("-*- NetworkStatsDB: " + s + "\n"); }
+ 
+ const {classes: Cc, interfaces: Ci, utils: Cu, results: Cr} = Components;
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/IndexedDBHelper.jsm");
+ 
+ const DB_NAME = "net_stats";
+-const DB_VERSION = 1;
+-const STORE_NAME = "net_stats";
++const DB_VERSION = 2;
++const STATS_STORE_NAME = "net_stats";
++const ALARM_STORE_NAME = "net_alarm";
+ 
+ // Constant defining the maximum values allowed per interface. If more, older
+ // will be erased.
+ const VALUES_MAX_LENGTH = 6 * 30;
+ 
+ // Constant defining the rate of the samples. Daily.
+ const SAMPLE_RATE = 1000 * 60 * 60 * 24;
+ 
+ this.NetworkStatsDB = function NetworkStatsDB(aGlobal) {
+   if (DEBUG) {
+     debug("Constructor");
+   }
+-  this.initDBHelper(DB_NAME, DB_VERSION, [STORE_NAME], aGlobal);
++  this.initDBHelper(DB_NAME, DB_VERSION, [STATS_STORE_NAME, ALARM_STORE_NAME], aGlobal);
+ }
+ 
+ NetworkStatsDB.prototype = {
+   __proto__: IndexedDBHelper.prototype,
+ 
+-  dbNewTxn: function dbNewTxn(txn_type, callback, txnCb) {
++  dbNewTxn: function dbNewTxn(store_name, txn_type, callback, txnCb) {
+     function successCb(result) {
+       txnCb(null, result);
+     }
+     function errorCb(error) {
+       txnCb(error, null);
+     }
+-    return this.newTxn(txn_type, STORE_NAME, callback, successCb, errorCb);
++    return this.newTxn(txn_type, store_name, callback, successCb, errorCb);
+   },
+ 
+   upgradeSchema: function upgradeSchema(aTransaction, aDb, aOldVersion, aNewVersion) {
+     if (DEBUG) {
+       debug("upgrade schema from: " + aOldVersion + " to " + aNewVersion + " called!");
+     }
+     let db = aDb;
+     let objectStore;
+     for (let currVersion = aOldVersion; currVersion < aNewVersion; currVersion++) {
+       if (currVersion == 0) {
+         /**
+          * Create the initial database schema.
+          */
+ 
+-        objectStore = db.createObjectStore(STORE_NAME, { keyPath: ["connectionType", "timestamp"] });
++        objectStore = db.createObjectStore(STATS_STORE_NAME, { keyPath: ["connectionType", "timestamp"] });
+         objectStore.createIndex("connectionType", "connectionType", { unique: false });
+         objectStore.createIndex("timestamp", "timestamp", { unique: false });
+         objectStore.createIndex("rxBytes", "rxBytes", { unique: false });
+         objectStore.createIndex("txBytes", "txBytes", { unique: false });
++        objectStore.createIndex("rxSystemBytes", "rxSystemBytes", { unique: false });
++        objectStore.createIndex("txSystemBytes", "txSystemBytes", { unique: false });
+         objectStore.createIndex("rxTotalBytes", "rxTotalBytes", { unique: false });
+         objectStore.createIndex("txTotalBytes", "txTotalBytes", { unique: false });
++
+         if (DEBUG) {
+-          debug("Created object stores and indexes");
++          debug("Upgrade 0");
++        }
++
++      } else if (currVersion == 1) {
++        objectStore = db.createObjectStore(ALARM_STORE_NAME, { keyPath: "id", autoIncrement: true });
++        objectStore.createIndex("iface", ['connectionId','threshold'], { unique: false});
++        objectStore.createIndex("data", "data", { unique: false});
++        objectStore.createIndex("manifestURL", "manifestURL", { unique: false});
++        objectStore.createIndex("pageURL", "pageURL", { unique: false});
++
++        if (DEBUG) {
++          debug("Upgrade 1");
+         }
+       }
+     }
+   },
+ 
+   convertDate: function convertDate(aDate) {
+     // Convert to UTC according to timezone and
+     // filter timestamp to get SAMPLE_RATE precission
+@@ -81,20 +96,22 @@ NetworkStatsDB.prototype = {
+ 
+   saveStats: function saveStats(stats, aResultCb) {
+     let timestamp = this.convertDate(stats.date);
+ 
+     stats = {connectionType: stats.connectionType,
+              timestamp:      timestamp,
+              rxBytes:        0,
+              txBytes:        0,
++             rxSystemBytes:  stats.rxBytes,
++             txSystemBytes:  stats.txBytes,
+              rxTotalBytes:   stats.rxBytes,
+              txTotalBytes:   stats.txBytes};
+ 
+-    this.dbNewTxn("readwrite", function(txn, store) {
++    this.dbNewTxn(STATS_STORE_NAME, "readwrite", function(txn, store) {
+       if (DEBUG) {
+         debug("Filtered time: " + new Date(timestamp));
+         debug("New stats: " + JSON.stringify(stats));
+       }
+ 
+       let request = store.index("connectionType").openCursor(stats.connectionType, "prev");
+       request.onsuccess = function onsuccess(event) {
+         let cursor = event.target.result;
+@@ -133,65 +150,72 @@ NetworkStatsDB.prototype = {
+       txn.abort();
+       throw new Error("Error processing samples");
+     }
+ 
+     if (DEBUG) {
+       debug("New: " + newSample.timestamp + " - Last: " + lastSample.timestamp + " - diff: " + diff);
+     }
+ 
+-    let rxDiff = newSample.rxTotalBytes - lastSample.rxTotalBytes;
+-    let txDiff = newSample.txTotalBytes - lastSample.txTotalBytes;
++    let rxDiff = newSample.rxSystemBytes - lastSample.rxSystemBytes;
++    let txDiff = newSample.txSystemBytes - lastSample.txSystemBytes;
+     if (rxDiff < 0 || txDiff < 0) {
+-      rxDiff = newSample.rxTotalBytes;
+-      txDiff = newSample.txTotalBytes;
++      rxDiff = newSample.rxSystemBytes;
++      txDiff = newSample.txSystemBytes;
+     }
+     newSample.rxBytes = rxDiff;
+     newSample.txBytes = txDiff;
+ 
++    newSample.rxTotalBytes = lastSample.rxTotalBytes + rxDiff;
++    newSample.txTotalBytes = lastSample.txTotalBytes + txDiff;
++
+     if (diff == 1) {
+       // New element.
+       this._saveStats(txn, store, newSample);
+       return;
+     }
+     if (diff > 1) {
+       // Some samples lost. Device off during one or more samplerate periods.
+       // Time or timezone changed
+       // Add lost samples with 0 bytes and the actual one.
+       if (diff > VALUES_MAX_LENGTH) {
+         diff = VALUES_MAX_LENGTH;
+       }
+ 
+       let data = [];
+       for (let i = diff - 2; i >= 0; i--) {
+         let time = newSample.timestamp - SAMPLE_RATE * (i + 1);
+-        let sample = {connectionType: newSample.connectionType,
+-                      timestamp:      time,
+-                      rxBytes:        0,
+-                      txBytes:        0,
+-                      rxTotalBytes:   lastSample.rxTotalBytes,
+-                      txTotalBytes:   lastSample.txTotalBytes};
++        let sample = {connectionType:  newSample.connectionType,
++                      timestamp:       time,
++                      rxBytes:         0,
++                      txBytes:         0,
++                      rxSystemBytes:   lastSample.rxSystemBytes,
++                      txSystemBytes:   lastSample.txSystemBytes,
++                      rxTotalBytes:    lastSample.rxTotalBytes,
++                      txTotalBytes:    lastSample.txTotalBytes};
+         data.push(sample);
+       }
+ 
+       data.push(newSample);
+       this._saveStats(txn, store, data);
+       return;
+     }
+     if (diff == 0 || diff < 0) {
+       // New element received before samplerate period.
+       // It means that device has been restarted (or clock / timezone change).
+       // Update element.
+ 
+       // If diff < 0, clock or timezone changed back. Place data in the last sample.
+ 
+       lastSample.rxBytes += rxDiff;
+       lastSample.txBytes += txDiff;
+-      lastSample.rxTotalBytes = newSample.rxTotalBytes;
+-      lastSample.txTotalBytes = newSample.txTotalBytes;
++      lastSample.rxSystemBytes = newSample.rxSystemBytes;
++      lastSample.txSystemBytes = newSample.txSystemBytes;
++      lastSample.rxTotalBytes += rxDiff;
++      lastSample.txTotalBytes += txDiff;
+       if (DEBUG) {
+         debug("Update: " + JSON.stringify(lastSample));
+       }
+       let req = lastSampleCursor.update(lastSample);
+     }
+   },
+ 
+   _saveStats: function _saveStats(txn, store, networkStats) {
+@@ -220,35 +244,60 @@ NetworkStatsDB.prototype = {
+       if (cursor) {
+         cursor.delete();
+         cursor.continue();
+       }
+     }.bind(this);
+   },
+ 
+   clear: function clear(aResultCb) {
+-    this.dbNewTxn("readwrite", function(txn, store) {
++    this.dbNewTxn(STATS_STORE_NAME, "readwrite", function(txn, store) {
+       if (DEBUG) {
+         debug("Going to clear all!");
+       }
+       store.clear();
+     }, aResultCb);
+   },
+ 
++  getCurrentStats: function getCurrentStats(aConnectionType, aDate, aResultCb) {
++    if (DEBUG) {
++      debug("Get current stats for " + aConnectionType + " since " + aDate);
++    }
++    this.dbNewTxn(STATS_STORE_NAME, "readonly", function(txn, store) {
++      let request = null;
++      if(aDate) {
++        let start = this.convertDate(aDate);
++        let lowFilter = [aConnectionType, start];
++        let range = this.dbGlobal.IDBKeyRange.lowerBound(lowFilter, false);
++        request = store.openCursor(range);
++      } else {
++        request = store.index("connectionType").openCursor(aConnectionType, "prev");
++      }
++
++      request.onsuccess = function onsuccess(event) {
++        txn.result = null;
++        let cursor = event.target.result;
++        if (cursor) {
++           txn.result = cursor.value;
++        }
++      };
++    }.bind(this), aResultCb);
++  },
++
+   find: function find(aResultCb, aOptions) {
+     let start = this.convertDate(aOptions.start);
+     let end = this.convertDate(aOptions.end);
+ 
+     if (DEBUG) {
+       debug("Find: connectionType:" + aOptions.connectionType + " start: " + start + " end: " + end);
+       debug("Start time: " + new Date(start));
+       debug("End time: " + new Date(end));
+     }
+ 
+-    this.dbNewTxn("readonly", function(txn, store) {
++    this.dbNewTxn(STATS_STORE_NAME, "readonly", function(txn, store) {
+       let lowFilter = [aOptions.connectionType, start];
+       let upFilter = [aOptions.connectionType, end];
+       let range = this.dbGlobal.IDBKeyRange.bound(lowFilter, upFilter, false, false);
+ 
+       let data = [];
+ 
+       if (!txn.result) {
+         txn.result = {};
+@@ -280,17 +329,17 @@ NetworkStatsDB.prototype = {
+     let start = this.convertDate(aOptions.start);
+     let end = this.convertDate(aOptions.end);
+ 
+     if (DEBUG) {
+       debug("FindAll: start: " + start + " end: " + end + "\n");
+     }
+ 
+     let self = this;
+-    this.dbNewTxn("readonly", function(txn, store) {
++    this.dbNewTxn(STATS_STORE_NAME, "readonly", function(txn, store) {
+       let lowFilter = start;
+       let upFilter = end;
+       let range = this.dbGlobal.IDBKeyRange.bound(lowFilter, upFilter, false, false);
+ 
+       let data = [];
+ 
+       if (!txn.result) {
+         txn.result = {};
+@@ -350,15 +399,182 @@ NetworkStatsDB.prototype = {
+     return SAMPLE_RATE;
+   },
+ 
+   get maxStorageSamples () {
+     return VALUES_MAX_LENGTH;
+   },
+ 
+   logAllRecords: function logAllRecords(aResultCb) {
+-    this.dbNewTxn("readonly", function(txn, store) {
++    this.dbNewTxn(STATS_STORE_NAME, "readonly", function(txn, store) {
+       store.mozGetAll().onsuccess = function onsuccess(event) {
+         txn.result = event.target.result;
+       };
+     }, aResultCb);
+   },
++
++  alarmToRecord: function alarmToRecord(aAlarm) {
++    let record = { timerId: aAlarm.timerId,
++                   connectionId: aAlarm.connectionId,
++                   threshold: aAlarm.threshold,
++                   data: aAlarm.data,
++                   manifestURL: aAlarm.manifestURL,
++                   pageURL: aAlarm.pageURL };
++
++    if (aAlarm.id) {
++      record.id = aAlarm.id;
++    }
++
++    return record;
++  },
++
++  recordToAlarm: function recordToalarm(aRecord) {
++    let alarm = { timerId: aRecord.timerId,
++                  connectionId: aRecord.connectionId,
++                  threshold: aRecord.threshold,
++                  data: aRecord.data,
++                  manifestURL: aRecord.manifestURL,
++                  pageURL: aRecord.pageURL };
++
++    if (aRecord.id) {
++      alarm.id = aRecord.id;
++    }
++    
++    return alarm;
++  },
++
++  addUsageAlarm: function addUsageAlarm(aAlarm, aResultCb) {
++    if (DEBUG) {
++      debug("addUsageAlarm");
++    }
++
++    this.dbNewTxn(ALARM_STORE_NAME, "readwrite", function(txn, store) {
++      if (DEBUG) {
++        debug("Going to add " + JSON.stringify(aAlarm));
++      }
++
++      let record = this.alarmToRecord(aAlarm);
++      store.put(record).onsuccess = function setResult(aEvent) {
++        txn.result = aEvent.target.result;
++        if (DEBUG) {
++          debug("Request successful. New record ID: " + txn.result);
++        }
++      };
++    }.bind(this), aResultCb);
++  },
++
++  getFirstAlarm: function getFirstAlarm(connectionId, aResultCb) {
++    let self = this;
++
++    this.dbNewTxn(ALARM_STORE_NAME, "readonly", function(txn, store) {
++      if (DEBUG) {
++        debug("Get first alarm for connection " + connectionId);
++      }
++
++      let lowFilter = [connectionId, 0];
++      let upFilter = [connectionId, Number.MAX_VALUE];
++      let range = self.dbGlobal.IDBKeyRange.bound(lowFilter, upFilter);
++
++      store.index("iface").openCursor(range).onsuccess = function onsuccess(event) {
++        let cursor = event.target.result;
++        txn.result = null;
++        if (cursor) {
++          txn.result = self.recordToAlarm(cursor.value);
++        }
++      };
++    }, aResultCb);
++  },
++
++  removeAlarm: function removeAlarm(aAlarmId, aResultCb) {
++    this.dbNewTxn(ALARM_STORE_NAME, "readwrite", function(txn, store) {
++      if (DEBUG) {
++        debug("Remove alarm " + aAlarmId);
++      }
++
++      store.openCursor(aAlarmId).onsuccess = function onsuccess(event) {
++        let cursor = event.target.result;
++        txn.result = false;
++        if (cursor) {
++          cursor.delete();
++          txn.result = true;
++        }
++      }
++    }, aResultCb);
++  },
++
++  removeAppAlarm: function removeAppAlarm(aAlarmId, aManifestURL, aResultCb) {
++    this.dbNewTxn(ALARM_STORE_NAME, "readwrite", function(txn, store) {
++      if (DEBUG) {
++        debug("Remove alarm " + aAlarmId + " of " + aManifestURL);
++      }
++
++      store.get(aAlarmId).onsuccess = function onsuccess(event) {
++        let result = event.target.result;
++        if (result && result.manifestURL == aManifestURL) {
++          store.delete(aAlarmId);
++        }
++      }
++    }, aResultCb);
++  },
++
++  removeAppAllAlarms: function removeAppAllAlarms(aManifestURL, aResultCb) {
++    this.dbNewTxn(ALARM_STORE_NAME, "readwrite", function(txn, store) {
++      if (DEBUG) {
++        debug("Remove alarms of " + aManifestURL.aAlarmId);
++      }
++
++      store.index("manifestURL").openCursor(aManifestURL).onsuccess = function onsuccess(event) {
++        let cursor = event.target.result;
++        if (cursor) {
++          cursor.delete();
++          cursor.continue();
++        }
++      }
++    }, aResultCb);
++  },
++
++  updateAlarm: function updateAlarm(aAlarm, aResultCb) {
++    let record = this.alarmToRecord(aAlarm);
++
++    this.dbNewTxn(ALARM_STORE_NAME, "readwrite", function(txn, store) {
++      if (DEBUG) {
++        debug("Update alarm " + aAlarm.id);
++      }
++
++      store.openCursor(record.id).onsuccess = function onsuccess(event) {
++        let cursor = event.target.result;
++        txn.result = false;
++        if (cursor) {
++          cursor.update(record);
++          txn.result = true;
++        }
++      }
++    }, aResultCb);
++  },
++
++  getAlarms: function getAlarms(connectionId, manifestURL, aResultCb) {
++    this.dbNewTxn(ALARM_STORE_NAME, "readonly", function(txn, store) {
++      if (DEBUG) {
++        debug("Get alarms for " + manifestURL);
++      }
++
++      txn.result = [];
++      store.index("manifestURL").openCursor(manifestURL).onsuccess = function onsuccess(event) {
++
++        let cursor = event.target.result;
++        if (cursor) {
++          if (connectionId == -1 || cursor.value.connectionId == connectionId) {
++            let alarm = { id: cursor.value.id,
++                          iface: cursor.value.connectionId,
++                          threshold: cursor.value.threshold,
++                          data: cursor.value.data };
++
++            txn.result.push(alarm);
++          }
++
++          cursor.continue();
++          return;
++        }
++      }
++    }, aResultCb);
++  }
++
+ };
+diff --git a/dom/network/src/NetworkStatsManager.js b/dom/network/src/NetworkStatsManager.js
+--- a/dom/network/src/NetworkStatsManager.js
++++ b/dom/network/src/NetworkStatsManager.js
+@@ -1,15 +1,15 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+-const DEBUG = false;
++const DEBUG = true;
+ function debug(s) { dump("-*- NetworkStatsManager: " + s + "\n"); }
+ 
+ const {classes: Cc, interfaces: Ci, utils: Cu, results: Cr} = Components;
+ 
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/DOMRequestHelper.jsm");
+ Cu.import("resource://gre/modules/ObjectWrapper.jsm");
+@@ -88,16 +88,45 @@ NetworkStats.prototype = {
+                                      classDescription: "NetworkStats",
+                                      interfaces: [nsIDOMMozNetworkStats],
+                                      flags: nsIClassInfo.DOM_OBJECT}),
+ 
+   QueryInterface : XPCOMUtils.generateQI([nsIDOMMozNetworkStats,
+                                           nsIDOMMozNetworkStatsData])
+ }
+ 
++// UsageAlarm
++const USAGEALARM_CID      = Components.ID("{2dcd5394-ad90-45d0-a755-3da80095f22f}");
++const nsIDOMMozUsageAlarm = Components.interfaces.nsIDOMMozUsageAlarm;
++
++function UsageAlarm(aAlarm) {
++  this.alarmId = aAlarm.id;
++  this.iface = aAlarm.iface;
++  this.threshold = aAlarm.threshold;
++  this.data = aAlarm.data;
++}
++
++UsageAlarm.prototype = {
++  __exposedProps__: {
++                      alarmId: 'r',
++                      iface: 'r',
++                      threshold:  'r',
++                      data:  'r',
++                     },
++
++  classID : USAGEALARM_CID,
++  classInfo : XPCOMUtils.generateCI({classID: USAGEALARM_CID,
++                                     contractID:"@mozilla.org/usagealarm;1",
++                                     classDescription: "UsageAlarm",
++                                     interfaces: [nsIDOMMozUsageAlarm],
++                                     flags: nsIClassInfo.DOM_OBJECT}),
++
++  QueryInterface : XPCOMUtils.generateQI([nsIDOMMozUsageAlarm])
++};
++
+ // NetworkStatsManager
+ 
+ const NETWORKSTATSMANAGER_CONTRACTID = "@mozilla.org/networkStatsManager;1";
+ const NETWORKSTATSMANAGER_CID        = Components.ID("{87529a6c-aef6-11e1-a595-4f034275cfa6}");
+ const nsIDOMMozNetworkStatsManager   = Components.interfaces.nsIDOMMozNetworkStatsManager;
+ 
+ function NetworkStatsManager() {
+   if (DEBUG) {
+@@ -132,16 +161,54 @@ NetworkStatsManager.prototype = {
+     this.checkPrivileges();
+ 
+     let request = this.createRequest();
+     cpmm.sendAsyncMessage("NetworkStats:Clear",
+                           {id: this.getRequestId(request)});
+     return request;
+   },
+ 
++  addUsageAlarm: function addUsageAlarm(connectionType, threshold, options) {
++    this.checkPrivileges();
++
++    if (!options) {
++      options = Object.create(null); 
++    }
++
++    let request = this.createRequest();
++    cpmm.sendAsyncMessage("NetworkStats:SetAlarm",
++                          {id: this.getRequestId(request),
++                           data: {connectionType: connectionType, threshold: threshold,
++                                  alarmStart: options.alarmStart, alarmEnd: options.alarmEnd,
++                                  data: options.data, manifestURL: this.manifestURL,
++                                  pageURL: this.pageURL}});
++    return request;
++  },
++
++  getAllUsageAlarms: function getAllUsageAlarms(connectionType) {
++    this.checkPrivileges();
++
++    let request = this.createRequest();
++    cpmm.sendAsyncMessage("NetworkStats:GetAlarms",
++                          {id: this.getRequestId(request),
++                           data: {connectionType: connectionType, manifestURL: this.manifestURL}});
++    return request;
++  },
++
++  removeUsageAlarms: function removeUsageAlarms(alarmId) {
++    this.checkPrivileges();
++
++    let request = this.createRequest();
++    cpmm.sendAsyncMessage("NetworkStats:RemoveAlarms",
++                          {id: this.getRequestId(request),
++                           data: {alarmId: alarmId, manifestURL: this.manifestURL}});
++
++    return request;
++  },
++
+   get connectionTypes() {
+     this.checkPrivileges();
+     return ObjectWrapper.wrap(cpmm.sendSyncMessage("NetworkStats:Types")[0], this._window);
+   },
+ 
+   get sampleRate() {
+     this.checkPrivileges();
+     return cpmm.sendSyncMessage("NetworkStats:SampleRate")[0] / 1000;
+@@ -151,18 +218,18 @@ NetworkStatsManager.prototype = {
+     this.checkPrivileges();
+     return cpmm.sendSyncMessage("NetworkStats:MaxStorageSamples")[0];
+   },
+ 
+   receiveMessage: function(aMessage) {
+     if (DEBUG) {
+       debug("NetworkStatsmanager::receiveMessage: " + aMessage.name);
+     }
++
+     let msg = aMessage.json;
+-
+     let req = this.takeRequest(msg.id);
+     if (!req) {
+       if (DEBUG) {
+         debug("No request stored with id " + msg.id);
+       }
+       return;
+     }
+ 
+@@ -184,16 +251,40 @@ NetworkStatsManager.prototype = {
+         if (msg.error) {
+           Services.DOMRequest.fireError(req, msg.error);
+           return;
+         }
+ 
+         Services.DOMRequest.fireSuccess(req, true);
+         break;
+ 
++      case "NetworkStats:SetAlarm:Return":
++      case "NetworkStats:RemoveAlarms:Return":
++        if (msg.error) {
++          Services.DOMRequest.fireError(req, msg.error);
++          return;
++        }
++
++        Services.DOMRequest.fireSuccess(req, msg.result);
++        break;
++
++      case "NetworkStats:GetAlarms:Return":
++        if (msg.error) {
++          Services.DOMRequest.fireError(req, msg.error);
++          return;
++        }
++
++        let alarms = Cu.createArrayIn(this._window);
++        for (let i = 0; i < msg.result.length; i++) {
++          alarms.push(new UsageAlarm(msg.result[i]));
++        }
++
++        Services.DOMRequest.fireSuccess(req, alarms);
++        break;
++
+       default:
+         if (DEBUG) {
+           debug("Wrong message: " + aMessage.name);
+         }
+     }
+   },
+ 
+   init: function(aWindow) {
+@@ -215,17 +306,31 @@ NetworkStatsManager.prototype = {
+       debug("has privileges: " + this.hasPrivileges);
+     }
+ 
+     if (!this.hasPrivileges) {
+       return null;
+     }
+ 
+     this.initHelper(aWindow, ["NetworkStats:Get:Return",
+-                              "NetworkStats:Clear:Return"]);
++                              "NetworkStats:Clear:Return",
++                              "NetworkStats:SetAlarm:Return",
++                              "NetworkStats:GetAlarms:Return",
++                              "NetworkStats:RemoveAlarms:Return"]);
++
++    // init app properties
++    let appsService = Cc["@mozilla.org/AppsService;1"]
++                        .getService(Ci.nsIAppsService);
++
++    this.manifestURL = appsService.getManifestURLByLocalId(principal.appId);
++
++    this.isApp = !(this.manifestURL.length == 0);
++    if (this.isApp) {
++      this.pageURL = principal.URI.spec;
++    }
+   },
+ 
+   // Called from DOMRequestIpcHelper
+   uninit: function uninit() {
+     if (DEBUG) {
+       debug("uninit call");
+     }
+   },
+@@ -236,11 +341,12 @@ NetworkStatsManager.prototype = {
+ 
+   classInfo : XPCOMUtils.generateCI({classID: NETWORKSTATSMANAGER_CID,
+                                      contractID: NETWORKSTATSMANAGER_CONTRACTID,
+                                      classDescription: "NetworkStatsManager",
+                                      interfaces: [nsIDOMMozNetworkStatsManager],
+                                      flags: nsIClassInfo.DOM_OBJECT})
+ }
+ 
+-this.NSGetFactory = XPCOMUtils.generateNSGetFactory([NetworkStatsData,
++this.NSGetFactory = XPCOMUtils.generateNSGetFactory([UsageAlarm,
++                                                     NetworkStatsData,
+                                                      NetworkStats,
+                                                      NetworkStatsManager]);
+diff --git a/dom/network/src/NetworkStatsManager.manifest b/dom/network/src/NetworkStatsManager.manifest
+--- a/dom/network/src/NetworkStatsManager.manifest
++++ b/dom/network/src/NetworkStatsManager.manifest
+@@ -1,9 +1,12 @@
+ component {3b16fe17-5583-483a-b486-b64a3243221c} NetworkStatsManager.js
+ contract @mozilla.org/networkStatsdata;1 {3b16fe17-5583-483a-b486-b64a3243221c}
+ 
+ component {037435a6-f563-48f3-99b3-a0106d8ba5bd} NetworkStatsManager.js
+ contract @mozilla.org/networkStats;1 {037435a6-f563-48f3-99b3-a0106d8ba5bd}
+ 
++component {2dcd5394-ad90-45d0-a755-3da80095f22f} NetworkStatsManager.js
++contract @mozilla.org/usagealarm;1 {2dcd5394-ad90-45d0-a755-3da80095f22f}
++
+ component {87529a6c-aef6-11e1-a595-4f034275cfa6} NetworkStatsManager.js
+ contract @mozilla.org/networkStatsManager;1 {87529a6c-aef6-11e1-a595-4f034275cfa6}
+ category JavaScript-navigator-property mozNetworkStats @mozilla.org/networkStatsManager;1
+diff --git a/dom/network/src/NetworkStatsService.jsm b/dom/network/src/NetworkStatsService.jsm
+--- a/dom/network/src/NetworkStatsService.jsm
++++ b/dom/network/src/NetworkStatsService.jsm
+@@ -1,64 +1,78 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+-const DEBUG = false;
+-function debug(s) { dump("-*- NetworkStatsService: " + s + "\n"); }
++const DEBUG = true;
++function debug(s) { 
++  if (DEBUG) {
++    dump("-*- NetworkStatsService: " + s + "\n");
++  }
++}
+ 
+ const {classes: Cc, interfaces: Ci, utils: Cu, results: Cr} = Components;
+ 
+ this.EXPORTED_SYMBOLS = ["NetworkStatsService"];
+ 
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/NetworkStatsDB.jsm");
++Cu.import("resource://gre/modules/AlarmService.jsm");
+ 
+ const NET_NETWORKSTATSSERVICE_CONTRACTID = "@mozilla.org/network/netstatsservice;1";
+ const NET_NETWORKSTATSSERVICE_CID = Components.ID("{18725604-e9ac-488a-8aa0-2471e7f6c0a4}");
+ 
++const TOPIC_BANDWIDTH_CONTROL = "netd-bandwidth-control"
++
+ const TOPIC_INTERFACE_REGISTERED = "network-interface-registered";
+ const NETWORK_TYPE_WIFI = Ci.nsINetworkInterface.NETWORK_TYPE_WIFI;
+ const NETWORK_TYPE_MOBILE = Ci.nsINetworkInterface.NETWORK_TYPE_MOBILE;
+ 
+ XPCOMUtils.defineLazyServiceGetter(this, "gIDBManager",
+                                    "@mozilla.org/dom/indexeddb/manager;1",
+                                    "nsIIndexedDatabaseManager");
+ 
+ XPCOMUtils.defineLazyServiceGetter(this, "ppmm",
+                                    "@mozilla.org/parentprocessmessagemanager;1",
+                                    "nsIMessageListenerManager");
+ 
+ XPCOMUtils.defineLazyServiceGetter(this, "networkManager",
+                                    "@mozilla.org/network/manager;1",
+                                    "nsINetworkManager");
+ 
++XPCOMUtils.defineLazyGetter(this, "messenger", function() {
++  return Cc["@mozilla.org/system-message-internal;1"]
++         .getService(Ci.nsISystemMessagesInternal);
++});
++
+ let myGlobal = this;
+ 
+ this.NetworkStatsService = {
+   init: function() {
+-    if (DEBUG) {
+-      debug("Service started");
+-    }
++    debug("Service started");
+ 
+     Services.obs.addObserver(this, "xpcom-shutdown", false);
+     Services.obs.addObserver(this, TOPIC_INTERFACE_REGISTERED, false);
++    Services.obs.addObserver(this, TOPIC_BANDWIDTH_CONTROL, false);
+     Services.obs.addObserver(this, "profile-after-change", false);
+ 
+     this.timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+ 
+     this._connectionTypes = Object.create(null);
+     this._connectionTypes[NETWORK_TYPE_WIFI] = "wifi";
+     this._connectionTypes[NETWORK_TYPE_MOBILE] = "mobile";
+ 
+     this.messages = ["NetworkStats:Get",
+                      "NetworkStats:Clear",
++                     "NetworkStats:SetAlarm",
++                     "NetworkStats:GetAlarms",
++                     "NetworkStats:RemoveAlarms",
+                      "NetworkStats:Types",
+                      "NetworkStats:SampleRate",
+                      "NetworkStats:MaxStorageSamples"];
+ 
+     this.messages.forEach(function(msgName) {
+       ppmm.addMessageListener(msgName, this);
+     }, this);
+ 
+@@ -66,36 +80,47 @@ this.NetworkStatsService = {
+     this._db = new NetworkStatsDB(myGlobal);
+ 
+     // Stats for all interfaces are updated periodically
+     this.timer.initWithCallback(this, this._db.sampleRate,
+                                 Ci.nsITimer.TYPE_REPEATING_PRECISE);
+ 
+     this.updateQueue = [];
+     this.isQueueRunning = false;
++
++    this._currentAlarm = Object.create(null);
++    this.initAlarms();
+   },
+ 
+   receiveMessage: function(aMessage) {
+     if (!aMessage.target.assertPermission("networkstats-manage")) {
+       return;
+     }
+ 
+-    if (DEBUG) {
+-      debug("receiveMessage " + aMessage.name);
+-    }
++    debug("receiveMessage " + aMessage.name);
++
+     let mm = aMessage.target;
+     let msg = aMessage.json;
+ 
+     switch (aMessage.name) {
+       case "NetworkStats:Get":
+         this.getStats(mm, msg);
+         break;
+       case "NetworkStats:Clear":
+         this.clearDB(mm, msg);
+         break;
++      case "NetworkStats:SetAlarm":
++        this.setUsageAlarm(mm, msg);
++        break;
++      case "NetworkStats:GetAlarms":
++        this.getUsageAlarms(mm, msg);
++        break;
++      case "NetworkStats:RemoveAlarms":
++        this.removeAlarms(mm, msg);
++        break;
+       case "NetworkStats:Types":
+         // This message is sync.
+         let types = [];
+         for (let i in this._connectionTypes) {
+           types.push(this._connectionTypes[i]);
+         }
+         return types;
+       case "NetworkStats:SampleRate":
+@@ -109,25 +134,50 @@ this.NetworkStatsService = {
+ 
+   observe: function observe(subject, topic, data) {
+     switch (topic) {
+       case TOPIC_INTERFACE_REGISTERED:
+         // If new interface is registered (notified from NetworkManager),
+         // the stats are updated for the new interface without waiting to
+         // complete the updating period
+         let network = subject.QueryInterface(Ci.nsINetworkInterface);
+-        if (DEBUG) {
+-          debug("Network " + network.name + " of type " + network.type + " registered");
++
++        debug("Network " + network.name + " of type " +
++              network.type + " registered");
++
++        let currentAlarm = this._currentAlarm[network.type];
++        if (!(Object.getOwnPropertyNames(currentAlarm).length === 0) && !currentAlarm.registered) {
++          let self = this;
++          this._setAlarm(currentAlarm.alarm, function onSet(error, result){
++            if (error == "InvalidStateError") {
++              self._fireAlarm(currentAlarm.alarm, false);
++            }
++
++          });
++          return;
+         }
++
+         this.updateStats(network.type);
+         break;
++      case TOPIC_BANDWIDTH_CONTROL:
++        debug("Bandwidth message from netd: " + JSON.stringify(data));
++
++        for( let i in networkManager.networkInterfaces) {
++          let iface = data.substring(data.lastIndexOf(" ") + 1);
++          if (iface == networkManager.networkInterfaces[i].name) {
++            let currentAlarm = this._currentAlarm[networkManager.networkInterfaces[i].type];
++            if (!(Object.getOwnPropertyNames(currentAlarm).length === 0)) {
++              this._fireAlarm(currentAlarm.alarm, false);
++            }
++            break;
++          }
++        }
++        break;
+       case "xpcom-shutdown":
+-        if (DEBUG) {
+-          debug("Service shutdown");
+-        }
++        debug("Service shutdown");
+ 
+         this.messages.forEach(function(msgName) {
+           ppmm.removeMessageListener(msgName, this);
+         }, this);
+ 
+         Services.obs.removeObserver(this, "xpcom-shutdown");
+         Services.obs.removeObserver(this, "profile-after-change");
+         this.timer.cancel();
+@@ -142,31 +192,48 @@ this.NetworkStatsService = {
+   /*
+    * nsITimerCallback
+    * Timer triggers the update of all stats
+    */
+   notify: function(timer) {
+     this.updateAllStats();
+   },
+ 
++  initAlarms: function initAlarms() {
++    let self = this;
++
++    for (let connection in this._connectionTypes) {
++      this._currentAlarm[connection] = Object.create(null);
++
++      this._db.getFirstAlarm(connection,
++                             function getResult(error, result) {
++        if (!error && result) {
++          self._setAlarm(result, function onSet(error, success){
++            if (error == "InvalidStateError") {
++              self._fireAlarm(result, false);
++            }
++          });
++        }
++      });
++    }
++  },
++
+   /*
+    * Function called from manager to get stats from database.
+    * In order to return updated stats, first is performed a call to
+    * updateAllStats function, which will get last stats from netd
+    * and update the database.
+    * Then, depending on the request (stats per interface or total stats)
+    * it retrieve them from database and return to the manager.
+    */
+   getStats: function getStats(mm, msg) {
+     this.updateAllStats(function onStatsUpdated(aResult, aMessage) {
+ 
+       let options = msg.data;
+-      if (DEBUG) {
+-        debug("getstats for: - " + options.connectionType + " -");
+-      }
++      debug("getstats for: - " + options.connectionType + " -");
+ 
+       if (!options.connectionType || options.connectionType.length == 0) {
+         this._db.findAll(function onStatsFound(error, result) {
+           mm.sendAsyncMessage("NetworkStats:Get:Return",
+                               { id: msg.id, error: error, result: result });
+         }, options);
+         return;
+       }
+@@ -177,17 +244,18 @@ this.NetworkStatsService = {
+             mm.sendAsyncMessage("NetworkStats:Get:Return",
+                                 { id: msg.id, error: error, result: result });
+           }, options);
+           return;
+         }
+       }
+ 
+       mm.sendAsyncMessage("NetworkStats:Get:Return",
+-                          { id: msg.id, error: "Invalid connectionType", result: null });
++                          { id: msg.id, error: "Invalid connectionType",
++                            result: null });
+ 
+     }.bind(this));
+   },
+ 
+   clearDB: function clearDB(mm, msg) {
+     this._db.clear(function onDBCleared(error, result) {
+       mm.sendAsyncMessage("NetworkStats:Clear:Return",
+                           { id: msg.id, error: error, result: result });
+@@ -281,18 +349,18 @@ this.NetworkStatsService = {
+       let item = this.updateQueue.shift();
+       for (let callback of item.callbacks) {
+         if(callback) {
+           callback(aResult, aMessage);
+         }
+       }
+     } else {
+       // The caller is a function that has pushed new elements to the queue,
+-      // if isQueueRunning is false it means there is no processing currently being
+-      // done, so start.
++      // if isQueueRunning is false it means there is no processing currently
++      // being done, so start.
+       if (this.isQueueRunning) {
+         if(this.updateQueue.length > 1) {
+           return;
+         }
+       } else {
+         this.isQueueRunning = true;
+       }
+     }
+@@ -303,79 +371,386 @@ this.NetworkStatsService = {
+       return;
+     }
+ 
+     // Call the update function for the next element.
+     this.update(this.updateQueue[0].type, this.processQueue.bind(this));
+   },
+ 
+   update: function update(connectionType, callback) {
+-    if (DEBUG) {
+-      debug("Update stats for " + this._connectionTypes[connectionType]);
+-    }
++    debug("Update stats for " + this._connectionTypes[connectionType]);
+ 
+     // Check if connection type is valid.
+     if (!this._connectionTypes[connectionType]) {
+       if (callback) {
+         callback(false, "Invalid network type " + connectionType);
+       }
+       return;
+     }
+ 
+     // Request stats to NetworkManager, which will get stats from netd, passing
+     // 'networkStatsAvailable' as a callback.
+     if (!networkManager.getNetworkInterfaceStats(connectionType, this.networkStatsAvailable.bind(this, callback))) {
+-      if (DEBUG) {
+-        debug("There is no interface registered for network type " + this._connectionTypes[connectionType]);
+-      }
++      debug("There is no interface registered for network type " +
++            this._connectionTypes[connectionType]);
+ 
+       // Interface is not registered (up), so stats are 0.
+       this.networkStatsAvailable(callback, true, connectionType, 0, 0, new Date());
+     }
+   },
+ 
+   /*
+    * Callback of request stats. Store stats in database.
+    */
+-  networkStatsAvailable: function networkStatsAvailable(callback, result, connType, rxBytes, txBytes, date) {
++  networkStatsAvailable: function networkStatsAvailable(callback, result,
++                                                        connType, rxBytes,
++                                                        txBytes, date) {
+     if (!result) {
+       if (callback) {
+         callback(false, "Netd IPC error");
+       }
+       return;
+     }
+ 
+     let stats = { connectionType: this._connectionTypes[connType],
+                   date:           date,
+                   rxBytes:        txBytes,
+                   txBytes:        rxBytes};
+ 
+-    if (DEBUG) {
+-      debug("Update stats for " + stats.connectionType + ": rx=" + stats.rxBytes +
+-            " tx=" + stats.txBytes + " timestamp=" + stats.date);
+-    }
++    debug("Update stats for " + stats.connectionType + ": rx=" + stats.rxBytes +
++          " tx=" + stats.txBytes + " timestamp=" + stats.date);
++
+     this._db.saveStats(stats, function onSavedStats(error, result) {
+       if (callback) {
+         if (error) {
+           callback(false, error);
+           return;
+         }
+ 
+-        callback(true, "OK");
++        callback(true, stats);
+       }
+     });
+   },
+ 
+   logAllRecords: function logAllRecords() {
+     this._db.logAllRecords(function onResult(error, result) {
+       if (error) {
+         debug("Error: " + error);
+         return;
+       }
+ 
+       debug("===== LOG =====");
+       debug("There are " + result.length + " items");
+       debug(JSON.stringify(result));
+     });
++  },
++
++  getUsageAlarms: function getUsageAlarms(mm, msg) {
++    let connectionType = msg.data.connectionType;
++    let manifestURL = msg.data.manifestURL;
++
++    let connectionId = -1;
++    if (connectionType) {
++      for (let i in this._connectionTypes) {
++        if (this._connectionTypes[i] == connectionType) {
++          connectionId = i;
++          break;
++        }
++      }
++
++      if (connectionId == -1) {
++        mm.sendAsyncMessage("NetworkStats:GetAlarms:Return",
++                            { id: msg.id, error: "InvalidInterface", result: null });
++        return;
++      }
++    }
++
++    let alarms = [];
++    let self = this;
++    this._db.getAlarms(connectionId, manifestURL, function onCompleted(error, result) {
++      if (error) {
++        mm.sendAsyncMessage("NetworkStats:GetAlarms:Return",
++                            { id: msg.id, error: error, result: result });
++        return;
++      }
++
++      for (let i = 0; i < result.length; i++) {
++        result[i].iface = self._connectionTypes[result[i].iface];
++      }
++
++      mm.sendAsyncMessage("NetworkStats:GetAlarms:Return",
++                          { id: msg.id, error: null, result: result });
++    });
++  },
++
++  removeAlarms: function removeAlarms(mm, msg) {
++    let alarmId = msg.data.alarmId;
++    let manifestURL = msg.data.manifestURL;
++
++    let self = this;
++    let callback = function onRemove(error, result) {
++      if (error) {
++        mm.sendAsyncMessage("NetworkStats:RemoveAlarms:Return",
++                            { id: msg.id, error: error, result: result });
++        return;
++      }
++
++      for (let i in self._currentAlarm) {
++        let currentAlarm = self._currentAlarm[i].alarm;
++        if (currentAlarm && ((alarmId == currentAlarm.id) || 
++            (alarmId == -1 && currentAlarm.manifestURL == manifestURL))) {
++
++          self._updateCurrentAlarm(currentAlarm.connectionId);
++
++        }
++      }
++
++      mm.sendAsyncMessage("NetworkStats:RemoveAlarms:Return",
++                          { id: msg.id, error: error, result: true });
++    };
++
++    if (alarmId == -1) {
++      this._db.removeAppAllAlarms(manifestURL, callback);
++    } else {
++      this._db.removeAppAlarm(alarmId, manifestURL, callback);
++    }
++  },
++
++  removeAppAllAlarms: function removeAppAllAlarms(aManifestURL, aResultCb) {
++ 
++  },
++
++  /*
++   * Function called from manager to set an usage alarm.
++   * ..... comments .....
++   */
++  setUsageAlarm: function setUsageAlarm(mm, msg) {
++    let options = msg.data;
++    let connectionType = options.connectionType;
++    let threshold = options.threshold;
++
++    debug("Set alarm at " + threshold + " for " + connectionType);
++
++    if (threshold < 0) {
++      mm.sendAsyncMessage("NetworkStats:SetAlarm:Return",
++                          { id: msg.id, error: "InvalidThresholdValue", result: null });
++    }
++
++    for (let i in this._connectionTypes) {
++      if (this._connectionTypes[i] == options.connectionType) {
++        let newAlarm = {
++          id: null,
++          timerId: null,
++          connectionId: i,
++          threshold: threshold,
++          absoluteThreshold: null,
++          alarmStart: options.alarmStart,
++          alarmEnd: options.alarmEnd,
++          data: options.data,
++          pageURL: options.pageURL,
++          manifestURL: options.manifestURL,
++        };
++
++        this._alarmSetup(newAlarm, function alarmReady(error, result){
++          mm.sendAsyncMessage("NetworkStats:SetAlarm:Return",
++                              { id: msg.id, error: error, result: result });
++
++          if (!error) {
++            this._setAlarm(newAlarm, function onSet(error, success){
++              if (error == "InvalidStateError") {
++                self._fireAlarm(newAlarm, false);
++              }
++            });
++          }
++        }.bind(this));
++        return;
++      }
++    }
++
++    mm.sendAsyncMessage("NetworkStats:SetAlarm:Return",
++                        { id: msg.id, error: "InvalidiConnectionType", result: null });
++  },
++
++  _alarmSetup: function _alarmSetup(aAlarm, callback) {
++    let self = this;
++
++    this._validateAlarm(aAlarm, function isValid(error, _threshold){
++
++      if (error) {
++        callback(error, _threshold);
++        return;
++      }
++
++      if (aAlarm.id) {
++        callback(null, aAlarm.id);
++        return;
++      }
++
++      aAlarm.absoluteThreshold = _threshold.absoluteThreshold;
++
++      self._db.addUsageAlarm(aAlarm, function addSuccessCb(error, aNewId) {
++        aAlarm.id = aNewId;
++
++        if (!error && aAlarm.alarmEnd) {
++          let timeAlarm = { date: aAlarm.alarmEnd.getTime(),
++                            ignoreTimezone: false,
++                            data: aAlarm};
++
++          AlarmService.add(timeAlarm, self._onAlarmExpired.bind(self), function onSuccess(timerId) {
++            aAlarm.timerId = timerId;
++            self._db.updateAlarm(aAlarm , function onUpdated(error, success) {
++              if (!success) {
++                AlarmService.remove(timerId);
++              }
++            });
++          });
++        }
++
++        callback(error, aNewId);
++      });
++    });
++  },
++
++  _validateAlarm: function _validateAlarm(aAlarm, callback) {
++    // Validate correct alarm end
++    let now = Date.now();
++    if ((aAlarm.alarmStart && aAlarm.alarmStart.getTime() >= now) || 
++        (aAlarm.alarmEnd && aAlarm.alarmEnd.getTime() <= now)) {
++      callback("InvalidDate", null);
++      return;
++    }
++
++    // Update Threshold will check if threshold is valid
++    this._updateThreshold(aAlarm, callback);
++  },
++
++  _setAlarm: function _setAlarm(aAlarm, callback) {
++    let currentAlarm = this._currentAlarm[aAlarm.connectionId];
++    if (!(Object.getOwnPropertyNames(currentAlarm).length === 0) &&
++        aAlarm.absoluteThreshold > currentAlarm.alarm.absoluteThreshold) {
++      callback(null, true);
++      return;
++    }
++
++    let self = this;
++
++    this._updateThreshold(aAlarm, function onUpdate(error, _threshold){
++
++      if (error) {
++        callback(error, null);
++        return;
++      }
++
++      let _callback = function onAlarmSet(error) {
++        if (error) {
++          debug("Set alarm error: " + error);
++          callback("netdError", null);
++          return;
++        }
++
++        self._currentAlarm[aAlarm.connectionId].alarm = aAlarm;
++        self._currentAlarm[aAlarm.connectionId].registered = true;
++
++        callback(null, true);
++      };
++
++      debug("Set alarm " + JSON.stringify(aAlarm));
++      if (!networkManager.setNetworkInterfaceAlarm(aAlarm.connectionId,
++                                                   _threshold.systemThreshold,
++                                                   _callback)) {
++        self._currentAlarm[aAlarm.connectionId].alarm = aAlarm;
++        self._currentAlarm[aAlarm.connectionId].registered = false;
++
++        callback("ConnectionNotRegistered", null);
++      }
++    });
++  },
++
++  _updateThreshold: function _updateThreshold(aAlarm, callback) {
++    let self = this;
++
++    this.updateStats(aAlarm.connectionId, function onStatsUpdated(aResult, aMessage) {
++      self._db.getCurrentStats(self._connectionTypes[aAlarm.connectionId],
++                               aAlarm.alarmStart, function onStatsFound(error, result) {
++        if (error) {
++          debug("Error getting stats for " + self._connectionTypes[connection] + ": " + error);
++          callback(error, result);
++          return;
++        }
++
++        let offset = aAlarm.threshold - result.rxTotalBytes - result.txTotalBytes;
++
++        if (offset <= 0) {
++          callback("InvalidStateError", null);
++          return;
++        }
++
++        let _threshold = { systemThreshold: result.rxSystemBytes + result.txSystemBytes + offset,
++                           absoluteThreshold: result.rxTotalBytes + result.txTotalBytes + offset}
++
++        callback(null, _threshold);
++      });
++    });
++  },
++
++  _fireAlarm: function _fireAlarm(aAlarm, expired) {
++    debug("Fire alarm");
++
++    let self = this;
++    this._db.removeAlarm(aAlarm.id, function onRemove(error, result){
++      if (!error && !result) {
++        return;
++      }
++
++      self._fireSystemMessage(aAlarm, expired);
++      if (aAlarm.timerId) {
++        AlarmService.remove(aAlarm.timerId);
++      }
++
++      self._updateCurrentAlarm(aAlarm.connectionId);
++    });
++  },
++
++  _updateCurrentAlarm: function _updateCurrentAlarm(aConnectionId) {
++    let self = this;
++    this._db.getFirstAlarm(aConnectionId, function onGet(error, result){
++      if (error) {
++        debug("Error getting the first alarm");
++        return;
++      }
++
++      if (!result) {
++        self._currentAlarm[aConnectionId] = Object.create(null);
++        networkManager.setNetworkInterfaceAlarm(aConnectionId, -1,
++                                                function onComplete(){});
++        return;
++      }
++
++      self._setAlarm(result, function onSet(error, success){
++        if (error == "InvalidStateError") {
++          self._fireAlarm(result, false);
++          return;
++        }
++      });
++    });
++  },
++
++  _fireSystemMessage: function _fireSystemMessage(aAlarm, expired) {
++    debug("Fire system message: " + JSON.stringify(aAlarm));
++
++    let manifestURI = Services.io.newURI(aAlarm.manifestURL, null, null);
++    let pageURI = Services.io.newURI(aAlarm.pageURL, null, null);
++
++    let alarm = { "id":              aAlarm.id,
++                  "threshold":       aAlarm.threshold,
++                  "data":            aAlarm.data,
++                  "expired":         expired};
++
++    messenger.sendMessage("alarm", alarm, pageURI, manifestURI);
++  },
++
++  _onAlarmExpired: function _onAlarmExpired(timeAlarm) {
++    debug("Alarm expired");
++    this._fireAlarm(timeAlarm.data, true);
+   }
+ };
+ 
+ NetworkStatsService.init();

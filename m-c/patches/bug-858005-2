@@ -1,0 +1,293 @@
+# HG changeset patch
+# Parent 7a4c43b888faf54ae6a21926652d513a6a6ed3d7
+# User Albert Crespell <acperez@tid.es>
+Bug 858005 - Part 2/3 Netd integration. r=vchang
+
+diff --git a/dom/system/gonk/NetworkManager.js b/dom/system/gonk/NetworkManager.js
+--- a/dom/system/gonk/NetworkManager.js
++++ b/dom/system/gonk/NetworkManager.js
+@@ -347,26 +347,104 @@ NetworkManager.prototype = {
+   active: null,
+   _overriddenActive: null,
+ 
+   overrideActive: function overrideActive(network) {
+     this._overriddenActive = network;
+     this.setAndConfigureActive();
+   },
+ 
++  setNetworkInterfaceAlarm: function setNetworkInterfaceAlarm(connectionType, threshold, callback) {
++    let iface = this.getNetworkInterface(connectionType);
++
++    if (!iface) {
++      debug("There is no interface registered for network type " + connectionType);
++      return false;
++    }
++
++    if (threshold < 0) {
++      this._disableNetworkInterfaceAlarm(iface.name, callback);
++      return true;
++    }
++
++    this._setNetworkInterfaceAlarm(iface.name, threshold, callback);
++    return true;
++  },
++
++  _setNetworkInterfaceAlarm: function _setNetworkInterfaceAlarm(iface, threshold, callback) {
++    debug("setNetworkInterfaceAlarm for " + iface + " at " + threshold + "bytes");
++
++    let params = {
++      cmd: "setNetworkInterfaceAlarm",
++      ifname: iface,
++      threshold: threshold
++    };
++
++    params.report = true;
++    params.isAsync = true;
++
++    this.controlMessage(params, function(result) {
++      if (result.resultCode >= NETD_COMMAND_OKAY && result.resultCode < NETD_COMMAND_FAIL) {
++        callback.networkUsageAlarmResult(null);
++        return;
++      }
++
++      this._enableNetworkInterfaceAlarm(iface, threshold, callback);
++    });
++  },
++
++  _enableNetworkInterfaceAlarm: function _enableNetworkInterfaceAlarm(iface, threshold, callback) {
++    debug("enableNetworkInterfaceAlarm for " + iface + " at " + threshold + "bytes");
++
++    let params = {
++      cmd: "enableNetworkInterfaceAlarm",
++      ifname: iface,
++      threshold: threshold
++    };
++
++    params.report = true;
++    params.isAsync = true;
++
++    this.controlMessage(params, function(result) {
++      if (result.resultCode >= NETD_COMMAND_OKAY && result.resultCode < NETD_COMMAND_FAIL) {
++        callback.networkUsageAlarmResult(null);
++        return;
++      }
++      callback(result.reason);
++    });
++  },
++
++  _disableNetworkInterfaceAlarm: function _disableNetworkInterfaceAlarm(iface, callback) {
++    debug("disableNetworkInterfaceAlarm for " + iface);
++
++    let params = {
++      cmd: "disableNetworkInterfaceAlarm",
++      ifname: iface,
++    };
++
++    params.report = true;
++    params.isAsync = true;
++
++    this.controlMessage(params, function(result) {
++      if (result.resultCode >= NETD_COMMAND_OKAY && result.resultCode < NETD_COMMAND_FAIL) {
++        callback.networkUsageAlarmResult(null);
++        return;
++      }
++      callback(result.reason);
++    });
++  },
++
+   getNetworkInterfaceStats: function getNetworkInterfaceStats(connectionType, callback) {
+     let iface = this.getNetworkInterface(connectionType);
+ 
+     if (!iface) {
+       debug("There is no interface registered for network type " + connectionType);
+       return false;
+     }
+ 
+-    debug("getNetworkInterfaceStats for " + iface.name);
+-
+     let params = {
+       cmd: "getNetworkInterfaceStats",
+       ifname: iface.name,
+       connType: connectionType
+     };
+ 
+     params.report = true;
+     params.isAsync = true;
+diff --git a/dom/system/gonk/net_worker.js b/dom/system/gonk/net_worker.js
+--- a/dom/system/gonk/net_worker.js
++++ b/dom/system/gonk/net_worker.js
+@@ -137,16 +137,29 @@ function networkInterfaceStatsFail(param
+   // Notify the main thread.
+   postMessage(params);
+   return true;
+ }
+ 
+ function networkInterfaceStatsSuccess(params) {
+   // Notify the main thread.
+   params.txBytes = parseFloat(params.resultReason);
++  postMessage(params);
++  return true;
++}
++
++function networkInterfaceAlarmFail(params) {
++  // Notify the main thread.
++  postMessage(params);
++  return true;
++}
++
++function networkInterfaceAlarmSuccess(params) {
++  // Notify the main thread.
++  params.error = parseFloat(params.resultReason);
+ 
+   postMessage(params);
+   return true;
+ }
+ 
+ /**
+  * Get network interface properties from the system property table.
+  *
+@@ -411,16 +424,41 @@ function getRxBytes(params, callback) {
+ 
+ function getTxBytes(params, callback) {
+   params.rxBytes = parseFloat(params.resultReason);
+ 
+   let command = "interface readtxcounter " + params.ifname;
+   return doCommand(command, callback);
+ }
+ 
++function enableAlarm(params, callback) {
++  let command = "bandwidth enable";
++  return doCommand(command, callback);
++}
++
++function disableAlarm(params, callback) {
++  let command = "bandwidth disable";
++  return doCommand(command, callback);
++}
++
++function setQuota(params, callback) {
++  let command = "bandwidth setiquota " + params.ifname + " " + parseInt('0xffffffffffffffff');
++  return doCommand(command, callback);
++}
++
++function removeQuota(params, callback) {
++  let command = "bandwidth removeiquota " + params.ifname;
++  return doCommand(command, callback);
++}
++
++function setAlarm(params, callback) {
++  let command = "bandwidth setinterfacealert " + params.ifname + " " + params.threshold;
++  return doCommand(command, callback);
++}
++
+ function escapeQuote(str) {
+   str = str.replace(/\\/g, "\\\\");
+   return str.replace(/"/g, "\\\"");
+ }
+ 
+ // The command format is "softap set wlan0 wl0.1 hotspot456 open null 6 0 8".
+ function setAccessPoint(params, callback) {
+   let command = "softap set " + params.ifname +
+@@ -663,16 +701,49 @@ function getNetworkInterfaceStats(params
+   params.rxBytes = -1;
+   params.txBytes = -1;
+   params.date = new Date();
+ 
+   chain(params, gNetworkInterfaceStatsChain, networkInterfaceStatsFail);
+   return true;
+ }
+ 
++let gNetworkInterfaceEnableAlarmChain = [enableAlarm,
++                                         setQuota,
++                                         setAlarm,
++                                         networkInterfaceAlarmSuccess];
++
++function enableNetworkInterfaceAlarm(params) {
++  debug("enableNetworkInterfaceAlarms: " + params.ifname);
++
++  chain(params, gNetworkInterfaceEnableAlarmChain, networkInterfaceAlarmFail);
++  return true;
++}
++
++let gNetworkInterfaceDisableAlarmChain = [removeQuota,
++                                          disableAlarm,
++                                          networkInterfaceAlarmSuccess];
++
++function disableNetworkInterfaceAlarm(params) {
++  debug("disableNetworkInterfaceAlarms: " + params.ifname);
++
++  chain(params, gNetworkInterfaceDisableAlarmChain, networkInterfaceAlarmFail);
++  return true;
++}
++
++let gNetworkInterfaceSetAlarmChain = [setAlarm,
++                                      networkInterfaceAlarmSuccess];
++
++function setNetworkInterfaceAlarm(params) {
++  debug("setNetworkInterfaceAlarms: " + params.ifname);
++
++  chain(params, gNetworkInterfaceSetAlarmChain, networkInterfaceAlarmFail);
++  return true;
++}
++
+ let debug;
+ if (DEBUG) {
+   debug = function (s) {
+     dump("Network Worker: " + s + "\n");
+   };
+ } else {
+   debug = function (s) {};
+ }
+diff --git a/dom/system/gonk/nsINetworkManager.idl b/dom/system/gonk/nsINetworkManager.idl
+--- a/dom/system/gonk/nsINetworkManager.idl
++++ b/dom/system/gonk/nsINetworkManager.idl
+@@ -104,16 +104,22 @@ interface nsINetworkStatsCallback : nsIS
+ {
+   void networkStatsAvailable(in boolean success,
+                              in short connType,
+                              in unsigned long rxBytes,
+                              in unsigned long txBytes,
+                              in jsval date);
+ };
+ 
++[scriptable, function, uuid(0706bfa2-ac2d-11e2-9a8d-7b6d988d4767)]
++interface nsINetworkUsageAlarmCallback : nsISupports
++{
++  void networkUsageAlarmResult(in jsval error);
++};
++
+ /**
+  * Manage network interfaces.
+  */
+ [scriptable, uuid(4bee9633-47ed-47ae-b92b-3e0679087561)]
+ interface nsINetworkManager : nsISupports
+ {
+   /**
+    * Register the given network interface with the network manager.
+@@ -208,9 +214,26 @@ interface nsINetworkManager : nsISupport
+    * @param callback
+    *        Callback to notify result and provide stats, connectionType
+    *        and the date when stats are retrieved
+    *
+    * @return false if there is no interface registered for the networkType param.
+    */
+   boolean getNetworkInterfaceStats(in short networkType, in nsINetworkStatsCallback callback);
+ 
++  /**
++   * Set Alarm of usage per interface
++   *
++   * @param networkType
++   *        Select the Network interface to set an alarm.
++   *
++   * @param threshold
++   *        Amount of data that will trigger the alarm.
++   *
++   * @param callback
++   *        Callback to notify the result.
++   *
++   * @return false if there is no interface registered for the networkType param.
++   */
++  boolean setNetworkInterfaceAlarm(in short networkType,
++                                   in long threshold,
++                                   in nsINetworkUsageAlarmCallback callback);
+ };

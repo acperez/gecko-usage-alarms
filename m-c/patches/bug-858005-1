@@ -1,0 +1,94 @@
+# HG changeset patch
+# Parent ea5985c82b16d82c164e89d2d8926b84375f01df
+# User Albert Crespell <acperez@tid.es>
+Bug 858005 - Part 1/3 IDL definition. r=jonas
+
+diff --git a/dom/network/interfaces/nsIDOMNetworkStatsManager.idl b/dom/network/interfaces/nsIDOMNetworkStatsManager.idl
+--- a/dom/network/interfaces/nsIDOMNetworkStatsManager.idl
++++ b/dom/network/interfaces/nsIDOMNetworkStatsManager.idl
+@@ -13,33 +13,84 @@ dictionary NetworkStatsOptions
+    * 'mobile', 'wifi' or null.
+    * If null, stats for both mobile and wifi are returned.
+    */
+   DOMString connectionType;
+   jsval start;              // date
+   jsval end;                // date
+ };
+ 
+-[scriptable,  uuid(87529a6c-aef6-11e1-a595-4f034275cfa6)]
++dictionary AlarmUsageOptions
++{
++  jsval alarmStart;              // date
++  jsval alarmEnd;                // date
++  jsval data;
++};
++
++[scriptable, builtinclass, uuid(2dcd5394-ad90-45d0-a755-3da80095f22f)]
++interface nsIDOMMozUsageAlarm : nsISupports
++{
++  readonly attribute unsigned long   alarmId;
++  readonly attribute DOMString       iface;
++  readonly attribute long            threshold;
++  readonly attribute jsval           data;
++};
++
++[scriptable,  uuid(46526afc-a120-4fd5-87b6-f8134b071106)]
+ interface nsIDOMMozNetworkStatsManager : nsISupports
+ {
+   /**
+    * Query network interface statistics.
+    *
+    * If options.connectionType is not provided, return statistics for all known
+    * network interfaces.
+    *
+    * If successful, the request result will be an nsIDOMMozNetworkStats object.
+    *
+    * If network stats are not available for some dates, then rxBytes &
+    * txBytes are undefined for those dates.
+    */
+   nsIDOMDOMRequest               getNetworkStats(in jsval options);
+ 
+   /**
++   * Install an usage alarm on an interface. The interface must be in
++   * availableInterfaces or an InvalidInterface exception will be raised.
++   *
++   * When total data usage reaches threshold bytes, a system message is
++   * sent to the application. Optional parameter data must be a cloneable
++   * object and it is included inside the alarm system message.
++   *
++   * If success, the result field of the request keeps the alarm Id.
++   */
++  nsIDOMDOMRequest               addUsageAlarm(in DOMString iface,
++                                               in long threshold,
++                                               [optional] in jsval options /* AlarmUsageOptions */);
++
++  /**
++   * Obtain all alarms for those interfaces in availableInterfaces.
++   * If an interface is provided, only retrieves the alarms
++   * for that interface. The interface must be one of those in
++   * availebleInterfaces or an InvalidInterface exception will be raised.
++   * 
++   * Each alarm object has the same fields as that
++   * in the system message:
++   *  - alarmId
++   *  - interface
++   *  - threshold
++   *  - data
++   */
++  nsIDOMDOMRequest               getAllUsageAlarms([optional] in DOMString iface);
++
++  /**
++   * Remove all usage alarms. If an alarmId is provided, then only that
++   * alarm is removed.
++   */
++  nsIDOMDOMRequest               removeUsageAlarms([optional] in long alarmId);
++
++  /**
+    * Return available connection types.
+    */
+   readonly attribute jsval       connectionTypes; // array of DOMStrings.
+ 
+   /**
+    * Clear all stats from DB.
+    */
+   nsIDOMDOMRequest               clearAllData();
